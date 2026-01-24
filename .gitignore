@@ -1,0 +1,13 @@
+# --- 必须忽略的系统/环境文件 ---
+venv/
+.venv/
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+workspace/
+
+# --- 绝对不能上传的敏感配置 ---
+.env
+.DS_Store
+.sol

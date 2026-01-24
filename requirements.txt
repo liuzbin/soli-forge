@@ -1,0 +1,19 @@
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+sqlalchemy==2.0.25
+pydantic==2.5.3
+pydantic-settings==2.1.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.6
+# LangChain 相关更新
+langchain==0.2.0
+langchain-core==0.2.0
+langchain-openai==0.1.7
+# LangGraph 更新到较新版本
+langgraph==0.0.60  # 或者更高，如 0.1.x，但要注意 API 变动
+python-dotenv==1.0.0
+httpx==0.26.0
+# MySQL 驱动
+pymysql==1.1.0
+cryptography

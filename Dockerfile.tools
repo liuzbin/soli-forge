@@ -1,0 +1,28 @@
+# 使用 Python 3.10 作为基础镜像 (Slither 需要 Python)
+FROM python:3.10-slim
+
+# 安装基础依赖
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# === 1. 安装 Foundry ===
+SHELL ["/bin/bash", "-c"]
+RUN curl -L https://foundry.paradigm.xyz | bash
+ENV PATH="/root/.foundry/bin:${PATH}"
+RUN foundryup
+
+# === 2. 安装 Slither 和 Solc-select ===
+RUN pip install slither-analyzer solc-select
+
+# === 3. 预装 Solidity 编译器 ===
+# 预先安装常用的 0.8.20 版本，避免运行时下载超时
+RUN solc-select install 0.8.20 && solc-select use 0.8.20
+
+# 设置工作目录 (映射宿主机目录用)
+WORKDIR /app
+
+# 验证安装
+RUN forge --version && slither --version
