@@ -24,9 +24,10 @@ class Task(Base):
     id = Column(String(36), primary_key=True, index=True)
     name = Column(String(100))
     status = Column(String(20), default="created")
-
+    is_deleted = Column(Boolean, default=False, index=True)
     contract_name = Column(String(100), nullable=True)
-
+    started_at = Column(DateTime(timezone=True), nullable=True)  # 点击开始的时间
+    duration = Column(Integer, default=0)  # 执行耗时(秒)
     # 存储代码资产
     source_code = Column(Text, nullable=True)
     exploit_code = Column(Text, nullable=True)

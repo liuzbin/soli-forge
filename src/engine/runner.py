@@ -1,19 +1,20 @@
 import os
+import traceback
+import threading
+from datetime import datetime
 from sqlalchemy.orm import Session
 from src.db.session import SessionLocal
 from src.db.models import Task, StreamLog, TaskArtifact
 from src.engine.tools.file_manager import FileManager
 from src.engine.graph.workflow import create_graph
-import threading
-
+# 👇 引入日志工具
+from src.core.logger import log_to_db
 
 MAX_CONCURRENT_TASKS = 3
 task_semaphore = threading.Semaphore(MAX_CONCURRENT_TASKS)
 
 
-# === 辅助函数：更新阶段 ===
 def update_task_phase(task_id: str, phase_name: str):
-    """供 Workflow 节点调用，实时更新数据库状态"""
     db = SessionLocal()
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
@@ -26,20 +27,15 @@ def update_task_phase(task_id: str, phase_name: str):
         db.close()
 
 
-# === 辅助函数：日志归档 ===
 def archive_logs_to_file(task_id: str):
-    """任务结束时，将 DB 日志转存为文件"""
     db = SessionLocal()
     try:
-        # 1. 查询所有日志
         logs = db.query(StreamLog).filter(StreamLog.task_id == task_id).order_by(StreamLog.timestamp).all()
         if not logs:
             return
 
-        # 2. 拼接内容
         full_log_content = "\n".join([f"[{log.timestamp}] [{log.level}] {log.content}" for log in logs])
 
-        # 3. 写入文件
         fm = FileManager(db, task_id)
         log_filename = f"execution_{task_id}.log"
         log_path = fm.task_dir / log_filename
@@ -47,7 +43,6 @@ def archive_logs_to_file(task_id: str):
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(full_log_content)
 
-        # 4. 记录 Artifact (用于历史查询下载)
         artifact = TaskArtifact(
             task_id=task_id,
             artifact_type="log_file",
@@ -57,7 +52,8 @@ def archive_logs_to_file(task_id: str):
         )
         db.add(artifact)
         db.commit()
-        print(f"✅ Logs archived to {log_filename}")
+        # 将归档动作也记录到日志
+        log_to_db(task_id, f"✅ Logs archived to {log_filename}")
 
     except Exception as e:
         print(f"❌ Log archive failed: {e}")
@@ -65,17 +61,16 @@ def archive_logs_to_file(task_id: str):
         db.close()
 
 
-# === 主运行逻辑 ===
 def run_agent_task(task_id: str):
-    # 1. 尝试获取执行令牌
     print(f"Task {task_id} is waiting for execution slot...")
 
-    # 这行代码会阻塞，直到有空闲名额
+    # 这一句在获取锁之前，先别写数据库，防止阻塞
+
     with task_semaphore:
-        print(f"🚀 Task {task_id} acquired slot! Starting execution...")
-        """
-        后台 Worker 执行 LangGraph 工作流
-        """
+        print(f"🚀 Task {task_id} acquired slot!")
+        # 👇 写入数据库，前端可见
+        log_to_db(task_id, "🚀 Task acquired execution slot. Initializing environment...", "INFO")
+
         db = SessionLocal()
         task = db.query(Task).filter(Task.id == task_id).first()
 
@@ -84,7 +79,6 @@ def run_agent_task(task_id: str):
             db.close()
             return
 
-        # Update status to running
         task.status = "running"
         task.current_phase = "Initializing"
         db.commit()
@@ -93,16 +87,27 @@ def run_agent_task(task_id: str):
         fm = FileManager(db, task_id)
         try:
             original_contract_path = fm.original_dir / task.contract_name
+
+            # 👇 打印调试信息到前端
+            log_to_db(task_id, f"📂 Reading contract from: {original_contract_path}", "DEBUG")
+
             with open(original_contract_path, "r", encoding="utf-8") as f:
                 original_code = f.read()
+
         except Exception as e:
+            error_msg = f"Could not read original file: {str(e)}"
+            print(f"❌ {error_msg}")
+            traceback.print_exc()
+
+            # 👇 将错误写入数据库，让用户知道为什么失败
+            log_to_db(task_id, f"❌ Critical Error: {error_msg}", "ERROR")
+
             task.status = "failed"
-            task.result_summary = f"Could not read original file: {str(e)}"
+            task.result_summary = error_msg
             db.commit()
             db.close()
             return
 
-        # Initial Agent State
         initial_state = {
             "task_id": task_id,
             "original_source": original_code,
@@ -120,36 +125,30 @@ def run_agent_task(task_id: str):
             "execution_status": "running"
         }
 
-        # Execute Graph
         app = create_graph()
 
         try:
-            # Invoke the graph
+            log_to_db(task_id, "🤖 AI Agents workflow started.", "INFO")
+
             final_state = app.invoke(initial_state)
 
-            # 重新拉取最新状态
             db.expire_all()
             task = db.query(Task).filter(Task.id == task_id).first()
 
             if task.status == "stopped":
-                print(f"Task {task_id} was stopped by user (DB check).")
+                log_to_db(task_id, "🛑 Task was stopped by user.", "WARNING")
             else:
                 status = final_state.get("execution_status", "unknown")
 
                 if status == "stopped":
                     task.status = "stopped"
                     task.result_summary = "Task stopped during execution."
-
-                # 兼容 workflow.py 返回的 "secure" 状态
                 elif status == "secure" or status == "pass":
                     task.status = "completed"
                     task.result_summary = "All threats mitigated. Contract is secure."
-
-                # 处理未通过的情况
                 elif status == "needs_fix":
                     task.status = "failed"
                     task.result_summary = "Vulnerabilities persist after repair attempts."
-
                 elif status == "fail_timeout":
                     task.status = "failed"
                     task.result_summary = "Max retries reached."
@@ -157,23 +156,44 @@ def run_agent_task(task_id: str):
                     task.status = "failed"
                     task.result_summary = "System error during execution."
                 else:
-                    # 兜底
                     task.status = "completed" if status == "secure" else "failed"
 
                 task.current_phase = "Finished"
+                log_to_db(task_id, f"🏁 Workflow finished with status: {task.status}", "INFO")
 
         except Exception as e:
-            print(f"Runner Exception: {e}")
+            error_msg = f"System Error: {str(e)}"
+            print(f"❌ Runner Execution Exception: {e}")
+            traceback.print_exc()
+
+            # 👇 异常上报到前端
+            log_to_db(task_id, f"❌ Workflow Crash: {error_msg}", "ERROR")
+
             db.expire_all()
             task = db.query(Task).filter(Task.id == task_id).first()
             if task.status != "stopped":
                 task.status = "failed"
-                task.result_summary = f"System Error: {str(e)}"
+                task.result_summary = error_msg
         finally:
-            # === 核心：归档日志 ===
             archive_logs_to_file(task_id)
 
             from sqlalchemy import func
-            task.finished_at = func.now()
+            now = datetime.now()
+
+            task = db.query(Task).filter(Task.id == task_id).first()
+            task.finished_at = now
+
+            if task.started_at:
+                start_time = task.started_at
+                if isinstance(start_time, str):
+                    try:
+                        start_time = datetime.fromisoformat(str(start_time))
+                    except:
+                        pass
+
+                if isinstance(start_time, datetime):
+                    delta = now - start_time
+                    task.duration = int(delta.total_seconds())
+
             db.commit()
             db.close()
