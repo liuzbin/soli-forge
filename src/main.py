@@ -30,4 +30,11 @@ app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(tasks.router, prefix="/api/tasks", tags=["tasks"])
 
 if __name__ == "__main__":
-    uvicorn.run("src.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "src.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        access_log=False,  # 关闭 "GET /... 200 OK" 这种刷屏日志
+        log_level="warning"  # 只显示警告和错误，以及我们自己 print 的内容
+    )

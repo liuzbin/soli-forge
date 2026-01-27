@@ -6,7 +6,8 @@ __pycache__/
 .idea/
 .vscode/
 workspace/
-
+storage/
+uploads/
 # --- 绝对不能上传的敏感配置 ---
 .env
 .DS_Store

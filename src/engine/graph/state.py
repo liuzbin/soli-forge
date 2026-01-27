@@ -8,24 +8,21 @@ class AgentState(TypedDict):
 
     # --- 动态上下文 ---
     current_source: str  # 当前最新版本的合约代码
-    current_phase: str  # 'static_scan' (Slither) 或 'fuzz_test' (Foundry)
+    current_phase: str  # 当前阶段描述
 
     # --- 计数器与熔断 ---
     round_count: int  # 总轮次
-    consecutive_success: int  # 动态扫描连续通过次数 (用于 fuzz 阶段)
-    max_rounds: int  # 最大允许轮次 (防止死循环)
+    max_rounds: int  # 最大允许轮次
+
+    # 👇👇👇 新增字段：本轮新增威胁数 👇👇👇
+    # 用于 Check 节点判定 (Condition A)
+    new_threats_count: int
 
     # --- 报告与日志 ---
     slither_report: str  # 最新 Slither 报告
-    fuzz_logs: str  # 最新 Foundry 运行日志 (包含失败详情)
-    compiler_error: str  # 如果编译失败，存报错信息
 
     # --- 攻防中间产物 ---
-    exploit_code: str  # 红方生成的攻击代码
-    judge_result: str  # 红方判别结果: 'VALID', 'FALSE_POSITIVE', 'SKIP'
-
-    # --- 历史记忆 (核心防死循环机制) ---
-    fix_history: List[str]  # 记录过去几轮的修复思路摘要
+    exploit_code: str  # 红方生成的攻击代码 (临时)
 
     # --- 最终状态 ---
-    execution_status: str  # 'running', 'pass', 'fail_timeout', 'fail_error'
+    execution_status: str  # 'secure', 'needs_fix', 'running'等
