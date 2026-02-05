@@ -38,10 +38,10 @@ def run_docker_command(work_dir: Path, command: str):
 
     docker_cmd = [
         "docker", "run", "--rm",
-        # 挂载宿主机任务目录到容器内的 /app
+        "--entrypoint", "",
         "-v", f"{abs_work_dir}:/app",
         "-w", "/app",
-        "ghcr.io/foundry-rs/foundry:latest",
+        "soliforge-worker",
         "/bin/sh", "-c",
         command
     ]
