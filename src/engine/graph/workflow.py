@@ -1,6 +1,7 @@
 import uuid
-import re
+from langgraph.graph import StateGraph, END, START
 import os
+import json
 from langgraph.graph import StateGraph, END
 from src.engine.graph.state import AgentState
 from src.engine.agents.red_agent import RedAgent
@@ -42,17 +43,16 @@ def node_discovery(state: AgentState):
     round_idx = state.get("round_count", 0)
 
     update_phase(task_id, f"Discovery ({ver})")
-    log_to_db(task_id, f"🔍 [Discovery - {ver}] Starting fresh scan on {ver}...")
+    log_to_db(task_id, f"🔍 [Discovery - {ver}] Starting scan...")
 
     db = SessionLocal()
     fm = FileManager(db, task_id)
 
-    # 1. 静态扫描 (Slither)
+    # 1. 静态扫描
     try:
         report = run_slither_scan(fm, ver)
-    except TypeError as e:
-        error_msg = f"Slither Call Error: {str(e)}"
-        log_to_db(task_id, f"❌ {error_msg}", "ERROR")
+    except Exception as e:
+        log_to_db(task_id, f"❌ Slither Error: {str(e)}", "ERROR")
         raise e
 
     task = db.query(Task).filter(Task.id == task_id).first()
@@ -60,40 +60,39 @@ def node_discovery(state: AgentState):
         task.slither_report = report
         db.commit()
 
-    # 2. 动态模糊测试 (Fuzzer)
-    log_to_db(task_id, f"🌪️ [Fuzzer - {ver}] Running fuzzing campaign...")
-
+    # 2. 动态模糊测试
+    log_to_db(task_id, f"🌪️ [Fuzzer - {ver}] Running fuzzing...")
     contract_path = fm.task_dir / fm.task.contract_name
 
-    # 👇👇👇 修改点：接收 stats 👇👇👇
+    # 运行 Fuzzer
     status, stats, test_file_path = run_fuzz_test(fm.task_dir, contract_path, round_idx)
 
-    new_threats_count = 0
+    # 👇👇👇 关键修复：逻辑漏洞修补 👇👇👇
+    # 如果 Fuzzer 连编译都过不去，不能当做 Safe，必须报错！
+    if status == "failed" and isinstance(stats, str):
+        # run_fuzz_test 在严重错误时 stats 可能是错误信息字符串
+        error_msg = f"Fuzzer Critical Failure: {stats}"
+        log_to_db(task_id, f"❌ {error_msg}", "ERROR")
+        raise Exception(error_msg)
 
-    # 👇👇👇 修改点：将统计数据写入数据库供前端显示 👇👇👇
+    if status == "failed" and stats.get("runs") == 0:
+        error_msg = "Fuzzer failed to run (Compilation Error likely)."
+        log_to_db(task_id, f"❌ {error_msg}", "ERROR")
+        raise Exception(error_msg)
+
+    # 保存统计数据
     if task:
-        # 构造前端需要的 JSON 格式，例如 {"total": 500, "failures": 0}
-        import json
         fuzzer_data = {
             "total": stats.get("runs", 0),
             "failures": stats.get("failures", 0),
             "status": "Secure" if stats.get("failures", 0) == 0 else "Vulnerable"
         }
-        # 将其存入 task.fuzzer_report (假设前端读这个)
-        # 或者如果你有专门的字段，请存入专门字段
-        # 这里我们存入 fuzzer_report，覆盖之前的文本
         task.fuzzer_report = json.dumps(fuzzer_data)
         db.commit()
 
-    if status == "success" and stats.get("failures", 0) > 0:
-        # 这种情况通常是因为 Fuzzer 跑通了，但是发现了 Bug (status=success指执行成功)
-        # 我们需要在 Fuzzer 代码里把 status 标为 success，但 workflow 里判断 failures > 0
-        pass
+    new_threats_count = 0
 
-        # 逻辑修正：如果 Fuzzer 发现了漏洞，Foundry 的 status 通常也是 Success (指测试运行完成)，
-    # 但具体的 test case status 是 Failed。
-    # 我们在 fuzzer.py 里已经处理了：如果 test_data status != Success -> stats['failures'] = 1
-
+    # 处理 Fuzzer 结果
     if stats.get("failures", 0) > 0 and test_file_path and test_file_path.exists():
         try:
             with open(test_file_path, "r", encoding="utf-8") as f:
@@ -116,17 +115,13 @@ def node_discovery(state: AgentState):
                 log_to_db(task_id, f"🔴 [Matrix] New Fuzzer Exploit Injected: {fuzz_name}")
         except Exception as e:
             log_to_db(task_id, f"⚠️ Failed to read fuzz file: {e}", "WARNING")
-
     else:
-        log_to_db(task_id, f"🟢 [Fuzzer] No crashes found in {ver}. Runs: {stats.get('runs')}")
+        log_to_db(task_id, f"🟢 [Fuzzer] No crashes found in {ver}. Runs: {stats.get('runs', 0)}")
 
     db.commit()
     db.close()
 
-    return {
-        "slither_report": report,
-        "new_threats_count": new_threats_count
-    }
+    return {"slither_report": report, "new_threats_count": new_threats_count}
 
 
 # =========================================
@@ -147,47 +142,89 @@ def node_red_weaponize(state: AgentState):
     # 1. 生成攻击代码
     exploit_code = agent.generate_exploit(state["current_source"], state["slither_report"])
 
-    # 2. 临时保存用于预检
-    temp_filename = f"Temp_Red_{ver}.t.sol"
-    fm.save_artifact(temp_filename, exploit_code, "temp")
+    # 👇👇👇 改动 1: 创建标准的 src 和 test 目录 👇👇👇
+    src_dir = fm.task_dir / "src"
+    test_dir = fm.task_dir / "test"
+    src_dir.mkdir(exist_ok=True)
+    test_dir.mkdir(exist_ok=True)
 
-    # 3. 预检 (Pre-Check): 攻击是否奏效？
-    log_to_db(task_id, f"⚡ [Red Team] Pre-validating exploit effectiveness...")
+    # 👇👇👇 改动 2: 将目标合约写入 src/Target.sol 👇👇👇
+    target_sol_path = src_dir / "Target.sol"
+    with open(target_sol_path, "w", encoding="utf-8") as f:
+        f.write(state["current_source"])
 
-    # 仅运行这个临时测试文件
-    container_path = f"/app/{temp_filename}"
-    cmd = f"forge test --json --match-path {container_path} --remappings forge-std/=/opt/foundry/lib/forge-std/src/"
+    # 👇👇👇 改动 3: 将攻击脚本写入 test/ 目录 👇👇👇
+    temp_filename = f"Red_Exploit_{ver}.t.sol"
+    temp_file_path = test_dir / temp_filename
+
+    with open(temp_file_path, "w", encoding="utf-8") as f:
+        f.write(exploit_code)
+
+    log_to_db(task_id, f"⚡ [Red Team] Pre-validating exploit...")
+
+    # 👇👇👇 改动 4: 运行命令指向 test/ 目录 👇👇👇
+    # 注意：在容器内，fm.task_dir 挂载为 /app
+    container_test_path = f"test/{temp_filename}"
+    cmd = f"forge test --json --match-path {container_test_path}"
 
     stdout, stderr = run_docker_command(fm.task_dir, cmd)
     full_output = (stdout or "") + (stderr or "")
 
-    # 解析结果
-    matches = re.findall(r'\[(PASS|FAIL).*?\]\s+(testExploit_\w+)\(\)', full_output)
+    # 3. 编译检查 (保留这个守门员)
+    if "Compilation failed" in full_output or "Error:" in full_output or "ParserError" in full_output:
+        # 有时候 JSON 混在报错里，我们需要更智能的判断
+        # 如果 output 里没有 '{'，那肯定是挂了
+        if "{" not in stdout:
+            error_msg = f"Red Team Exploit Compilation Failed!\nOutput: {full_output}"
+            log_to_db(task_id, f"❌ {error_msg}", "ERROR")
+            raise Exception("Red Team Code Compilation Failed. Workflow Halted.")
 
     valid_exploits_count = 0
 
-    for status, func_name in matches:
-        if status == "PASS":
-            # 🎯 攻击成功 (PASS) -> 漏洞存在 -> 注入矩阵 (标红)
-            exists = db.query(TestCase).filter_by(task_id=task_id, name=func_name).first()
-            if not exists:
-                tc = TestCase(
-                    id=str(uuid.uuid4()), task_id=task_id,
-                    source="RED_TEAM",
-                    name=func_name,
-                    description=f"Verified Exploit from {ver}",
-                    code=exploit_code,
-                    status="FAILING",  # 直接标红
-                    version_added=ver
-                )
-                db.add(tc)
-                valid_exploits_count += 1
-                log_to_db(task_id, f"🔴 [Matrix] Red Team Exploit Verified & Injected: {func_name}")
-        else:
-            # 攻击失败 -> 误报或无效 -> 丢弃
-            log_to_db(task_id, f"🗑️ [Red Team] Discarding ineffective exploit: {func_name}")
+    # 4. JSON 解析 (替代 Regex)
+    try:
+        # 提取 JSON 部分 (防止有其他日志干扰)
+        if "{" in stdout:
+            json_str = stdout[stdout.find('{'):stdout.rfind('}') + 1]
+            data = json.loads(json_str)
 
-    # 如果有有效攻击，保存为正式文件供后续回归测试
+            # 遍历 Forge JSON 结构
+            # 结构通常是: { "tests/Temp_Red_v1.t.sol": { "test_results": { "testExploit_01": { "status": "Success" } } } }
+            for file_path, file_data in data.items():
+                test_results = file_data.get("test_results", {})
+
+                for test_name, result in test_results.items():
+                    status = result.get("status")
+
+                    # Foundry JSON 中: "Success" = PASS, "Failure" = FAIL
+                    if status == "Success":
+                        # 🎯 攻击成功！
+                        exists = db.query(TestCase).filter_by(task_id=task_id, name=test_name).first()
+                        if not exists:
+                            tc = TestCase(
+                                id=str(uuid.uuid4()), task_id=task_id,
+                                source="RED_TEAM",
+                                name=test_name,
+                                description=f"Verified Exploit from {ver}",
+                                code=exploit_code,
+                                status="FAILING",
+                                version_added=ver
+                            )
+                            db.add(tc)
+                            valid_exploits_count += 1
+                            log_to_db(task_id, f"🔴 [Matrix] Verified & Injected: {test_name}")
+                    else:
+                        # 攻击失败
+                        reason = result.get("reason", "Unknown")
+                        log_to_db(task_id, f"🗑️ [Red Team] Discarding failed exploit: {test_name} (Reason: {reason})")
+        else:
+            log_to_db(task_id, f"⚠️ Warning: No JSON output from Forge. Full Output: {full_output}", "WARNING")
+
+    except Exception as e:
+        log_to_db(task_id, f"❌ JSON Parse Error in Red Team: {str(e)}", "ERROR")
+        # 这里可以选择抛出异常，或者忽略当前轮次
+
+    # 5. 保存有效攻击文件
     if valid_exploits_count > 0:
         perm_filename = f"Red_Exploit_{ver}_{uuid.uuid4().hex[:6]}.t.sol"
         fm.save_artifact(perm_filename, exploit_code, "exploit")
@@ -200,9 +237,7 @@ def node_red_weaponize(state: AgentState):
     db.commit()
     db.close()
 
-    # 更新本轮新增威胁计数 (Fuzzer + RedTeam)
     total_new_threats = current_new_threats + valid_exploits_count
-
     return {"new_threats_count": total_new_threats}
 
 
@@ -278,43 +313,90 @@ def node_blue_fix(state: AgentState):
 # =========================================
 def node_validate_matrix(state: AgentState):
     task_id = state["task_id"]
-    # 此时代码已经是 VN+1 了
     current_ver = get_ver_tag(state)
-
     update_phase(task_id, f"Regression ({current_ver})")
-    log_to_db(task_id, f"🧪 [Validation - {current_ver}] Running regression test on ALL Matrix cases...")
+    log_to_db(task_id, f"🧪 [Validation - {current_ver}] Regression testing...")
 
     db = SessionLocal()
     fm = FileManager(db, task_id)
 
-    # 运行目录下所有的 .t.sol (包括历史累积的所有攻击脚本)
-    results, raw_output = run_forge_test_json(fm.task_dir)
+    # 👇👇👇 改动 1: 覆盖 src/Target.sol 为最新代码 (v2/v3) 👇👇👇
+    src_dir = fm.task_dir / "src"
+    src_dir.mkdir(exist_ok=True)
+    target_sol_path = src_dir / "Target.sol"
 
-    passed_cnt = 0  # 绿
-    failed_cnt = 0  # 红
+    with open(target_sol_path, "w", encoding="utf-8") as f:
+        f.write(state["current_source"])
 
-    all_cases = db.query(TestCase).filter(TestCase.task_id == task_id).all()
+    # 👇👇👇 改动 2: 扫描 test/ 目录下的所有测试文件 👇👇👇
+    # 这样旧的 Red_Exploit_v1.t.sol (在 test/ 里) 会引用新的 src/Target.sol
+    container_pattern = "test/*.t.sol"
+    cmd = f"forge test --json {container_pattern}"
 
-    for tc in all_cases:
-        if tc.name in results:
-            res = results[tc.name]
-            # Foundry 逻辑:
-            # PASS = 断言成立 = 攻击成功 = 漏洞存在 = RED
-            # FAIL = 断言失败 = 攻击被阻 = 防御成功 = GREEN
+    stdout, stderr = run_docker_command(fm.task_dir, cmd)
+    full_output = (stdout or "") + (stderr or "")
 
-            if res == "PASS":
-                tc.status = "FAILING"
-                failed_cnt += 1
+    # 2. 编译检查 (防止蓝队改坏了代码导致编译不过)
+    if "Compilation failed" in full_output or "Error:" in full_output:
+        if "{" not in stdout:
+            log_to_db(task_id, f"❌ Regression Compilation Failed! Blue Team broke the build.", "ERROR")
+            # 这里可以选择抛异常，或者让它进入下一轮修复
+            # 为了防止死循环，我们抛出异常让蓝队知道出事了
+            raise Exception(f"Regression Compilation Failed: {full_output}")
+
+    passed_cnt = 0
+    failed_cnt = 0
+
+    # 3. 解析结果并更新数据库
+    try:
+        results_map = {}
+        if "{" in stdout:
+            json_str = stdout[stdout.find('{'):stdout.rfind('}') + 1]
+            data = json.loads(json_str)
+
+            # 展平结果：文件名 -> 测试函数 -> 结果
+            for file_path, file_data in data.items():
+                test_results = file_data.get("test_results", {})
+                for test_name, result in test_results.items():
+                    results_map[test_name] = result.get("status")  # "Success" or "Failure"
+
+        # 4. 对比数据库中的已知威胁
+        all_cases = db.query(TestCase).filter(TestCase.task_id == task_id).all()
+
+        for tc in all_cases:
+            # 只关心由于 Red Team 生成的测试用例 (Fuzzer的也可以，但主要是 Red)
+            if tc.name in results_map:
+                forge_status = results_map[tc.name]
+
+                # 👇👇👇 关键逻辑反转 (Logic Inversion) 👇👇👇
+                # 在回归测试中：
+                # 如果攻击代码执行 Success -> 说明攻击成功 -> 漏洞依然存在 -> FAILING
+                # 如果攻击代码执行 Failure -> 说明攻击失败 (被防住了) -> 漏洞已修复 -> PASSING
+
+                if forge_status == "Success":
+                    tc.status = "FAILING"  # 哎呀，还是被攻破了
+                    failed_cnt += 1
+                    log_to_db(task_id, f"🔴 Vulnerability '{tc.name}' is still active!")
+                else:
+                    tc.status = "PASSING"  # 好耶，攻击被拦截了
+                    passed_cnt += 1
+                    log_to_db(task_id, f"🟢 Vulnerability '{tc.name}' mitigated.")
             else:
-                tc.status = "PASSING"
-                passed_cnt += 1
+                # 如果没在结果里找到，可能被过滤了，或者文件丢失
+                # 保持原状态，或者标记为 WARNING
+                pass
 
-    db.commit()
+        db.commit()
+
+    except Exception as e:
+        log_to_db(task_id, f"❌ Validation Logic Error: {str(e)}", "ERROR")
+
     db.close()
 
-    log_to_db(task_id, f"📊 [Regression Result] {passed_cnt} Green (Secure) | {failed_cnt} Red (Vulnerable)")
+    log_to_db(task_id, f"📊 [Regression] {passed_cnt} Green (Fixed) | {failed_cnt} Red (Active)")
 
-    return {}
+    # 返回剩余的威胁数量，如果没有威胁了，Router 就会结束任务
+    return {"new_threats_count": failed_cnt}
 
 
 # =========================================
@@ -351,8 +433,7 @@ def create_graph():
     workflow.add_node("validate", node_validate_matrix)
 
     # 流程编排 (闭环结构)
-    workflow.set_entry_point("discovery")
-
+    workflow.add_edge(START, "discovery")
     # 1. 侦查 -> 2. 武器化 -> 3. 判定
     workflow.add_edge("discovery", "weaponize")
     workflow.add_edge("weaponize", "check")
